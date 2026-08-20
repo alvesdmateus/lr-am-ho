@@ -1,24 +1,35 @@
 import os
-import subprocess
 import time
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from tools.protocol import ToolRequest, ToolResponse, ToolType, SafetyPolicy
+from tools.sandbox import BaseSandbox, LocalSandbox, DockerSandbox
 
 
 class ToolSidecar:
     """
     Tool Proxy & Safety Sidecar.
     Intercepts tool calls, enforces safety policies, automatically truncates large outputs,
-    and captures workspace diffs.
+    and delegates execution to a pluggable Sandbox backend (Local or Docker).
     """
+
     def __init__(
         self,
         workspace_dir: str = ".",
         policy: Optional[SafetyPolicy] = None,
+        sandbox: Optional[BaseSandbox] = None,
+        sandbox_type: str = "local",
+        docker_image: str = "python:3.11-slim",
     ):
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.policy = policy or SafetyPolicy()
         self.invocation_history: List[Dict[str, Any]] = []
+
+        if sandbox:
+            self.sandbox = sandbox
+        elif sandbox_type == "docker":
+            self.sandbox = DockerSandbox(workspace_dir=self.workspace_dir, image=docker_image)
+        else:
+            self.sandbox = LocalSandbox(workspace_dir=self.workspace_dir)
 
     def dispatch(self, request: ToolRequest) -> ToolResponse:
         """Main entry point for all tool invocations from the Worker."""
@@ -29,24 +40,26 @@ class ToolSidecar:
                 success=False,
                 output="",
                 error=f"Security Policy Violation: {safety_error}",
+                metadata={"blocked_by_sidecar": True},
             )
 
-        # 2. Dispatch by tool type
+        # 2. Dispatch to Sandbox Backend
         start_time = time.time()
         try:
             if request.tool_type == ToolType.BASH:
-                response = self._handle_bash(request.parameters.get("command", ""))
+                response = self.sandbox.execute_command(request.parameters.get("command", ""))
             elif request.tool_type == ToolType.FILE_WRITE:
-                response = self._handle_file_write(
+                response = self.sandbox.write_file(
                     request.parameters.get("file_path", ""),
                     request.parameters.get("content", ""),
                 )
             elif request.tool_type == ToolType.FILE_READ:
-                response = self._handle_file_read(request.parameters.get("file_path", ""))
+                response = self.sandbox.read_file(request.parameters.get("file_path", ""))
             elif request.tool_type == ToolType.RUN_TESTS:
-                response = self._handle_run_tests(request.parameters.get("test_cmd", ""))
+                cmd = request.parameters.get("test_cmd", "") or "python -m unittest discover -s tests"
+                response = self.sandbox.execute_command(cmd)
             elif request.tool_type == ToolType.GIT_DIFF:
-                response = self._handle_git_diff()
+                response = self.sandbox.get_git_diff()
             else:
                 response = ToolResponse(
                     success=False,
@@ -111,65 +124,7 @@ class ToolSidecar:
 
         return response
 
-    # -------------------------------------------------------------------------
-    # Handlers
-    # -------------------------------------------------------------------------
-    def _handle_bash(self, command: str) -> ToolResponse:
-        if not command:
-            return ToolResponse(success=False, output="", error="No command provided.")
-        try:
-            res = subprocess.run(
-                command,
-                shell=True,
-                cwd=self.workspace_dir,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            combined_output = res.stdout + (("\n" + res.stderr) if res.stderr else "")
-            return ToolResponse(
-                success=(res.returncode == 0),
-                output=combined_output.strip(),
-                error=res.stderr.strip() if res.returncode != 0 else None,
-                metadata={"return_code": res.returncode},
-            )
-        except subprocess.TimeoutExpired:
-            return ToolResponse(
-                success=False,
-                output="",
-                error="Command execution timed out after 30s.",
-            )
-
-    def _handle_file_write(self, file_path: str, content: str) -> ToolResponse:
-        if not file_path:
-            return ToolResponse(success=False, output="", error="File path required.")
-        target = os.path.join(self.workspace_dir, file_path) if not os.path.isabs(file_path) else file_path
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(content)
-        return ToolResponse(
-            success=True,
-            output=f"Successfully wrote {len(content)} bytes to {file_path}",
-            metadata={"bytes_written": len(content)},
-        )
-
-    def _handle_file_read(self, file_path: str) -> ToolResponse:
-        if not file_path:
-            return ToolResponse(success=False, output="", error="File path required.")
-        target = os.path.join(self.workspace_dir, file_path) if not os.path.isabs(file_path) else file_path
-        if not os.path.exists(target):
-            return ToolResponse(success=False, output="", error=f"File not found: {file_path}")
-        with open(target, "r", encoding="utf-8") as f:
-            content = f.read()
-        return ToolResponse(
-            success=True,
-            output=content,
-            metadata={"bytes_read": len(content)},
-        )
-
-    def _handle_run_tests(self, test_cmd: str) -> ToolResponse:
-        cmd = test_cmd or "python -m unittest discover -s tests"
-        return self._handle_bash(cmd)
-
-    def _handle_git_diff(self) -> ToolResponse:
-        return self._handle_bash("git diff")
+    def close(self) -> None:
+        """Cleans up the sandbox backend."""
+        if self.sandbox:
+            self.sandbox.reset()

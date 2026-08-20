@@ -16,7 +16,7 @@ class TaskStatus(str, Enum):
 class Task(BaseModel):
     id: str
     title: str
-    description: str
+    description: str = ""
     definition_of_done: List[str] = Field(default_factory=list)
     dependencies: List[str] = Field(default_factory=list)
     status: TaskStatus = TaskStatus.PENDING

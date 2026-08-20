@@ -1,31 +1,55 @@
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Union
 from harness.state import Goal, Task, TaskStatus, HarnessState, ExecutionResult, EvaluationVerdict
+from harness.goal_parser import GoalParser
+from harness.decomposition import DecompositionValidator, DecompositionError
 from storage.state_store import StateStore
 from agent.manager import ManagerAgent
 from agent.worker import Worker
 from agent.evaluator import EvaluatorAgent
 from agent.memory import TieredMemoryManager
+from llm.client import LLMClient
 
 
 class HarnessEngine:
     """
     Long-Running Harness Engine.
     Owns the master loop, enforces Definition of Done, manages crash-resilient checkpoints,
-    and coordinates Manager, Worker, Evaluator, and Tiered Memory.
+    validates task decompositions, and coordinates Manager, Worker, Evaluator, and Tiered Memory.
     """
+
     def __init__(
         self,
-        goal: Goal,
+        goal: Union[Goal, str],
         storage_dir: str = ".harness",
         max_iterations: int = 50,
         max_consecutive_failures: int = 5,
+        sandbox_type: str = "local",
+        docker_image: str = "python:3.11-slim",
+        llm_client: Optional[LLMClient] = None,
+        max_decomposition_retries: int = 3,
     ):
+        self.storage_dir = storage_dir
+        self.llm_client = llm_client
+        self.max_decomposition_retries = max_decomposition_retries
+        self.validator = DecompositionValidator()
+
+        # Goal parsing (supports raw string or Goal model)
+        if isinstance(goal, str):
+            self.goal = GoalParser().parse(goal)
+        else:
+            self.goal = goal
+
         self.state_store = StateStore(storage_dir=f"{storage_dir}/state")
         self.memory_agent = TieredMemoryManager(storage_dir=f"{storage_dir}/storage")
-        self.manager = ManagerAgent()
-        self.worker = Worker()
-        self.evaluator = EvaluatorAgent()
+        self.manager = ManagerAgent(llm_client=llm_client)
+        self.worker = Worker(
+            workspace_dir=f"{storage_dir}/workspace",
+            sandbox_type=sandbox_type,
+            docker_image=docker_image,
+            llm_client=llm_client,
+        )
+        self.evaluator = EvaluatorAgent(llm_client=llm_client)
 
         # Initialize or restore state
         saved_state = self.state_store.load_state()
@@ -33,7 +57,7 @@ class HarnessEngine:
             self.state = HarnessState(**saved_state)
         else:
             self.state = HarnessState(
-                goal=goal,
+                goal=self.goal,
                 max_iterations=max_iterations,
                 max_consecutive_failures=max_consecutive_failures,
             )
@@ -63,9 +87,9 @@ class HarnessEngine:
         self.state.iteration_count += 1
         self.state_store.log_event("step_start", {"iteration": self.state.iteration_count})
 
-        # Phase 1: Goal Decomposition (if no tasks exist yet)
+        # Phase 1: Goal Decomposition & Harness Validation (if no tasks exist yet)
         if not self.state.tasks:
-            tasks = self.manager.decompose_goal(self.state.goal)
+            tasks = self._decompose_and_validate_goal()
             self.state.tasks = {t.id: t for t in tasks}
             self.state_store.log_event("goal_decomposed", {"task_count": len(tasks)})
 
@@ -120,6 +144,36 @@ class HarnessEngine:
         # Phase 8: Persistence & Checkpoint
         self._save_checkpoint(f"iter_{self.state.iteration_count}")
         return True
+
+    def _decompose_and_validate_goal(self) -> List[Task]:
+        """
+        Decomposes the goal into a task list and validates its structural integrity.
+        Retries with feedback if validation fails (up to max_decomposition_retries).
+        """
+        errors: List[str] = []
+        for attempt in range(self.max_decomposition_retries):
+            feedback = errors if attempt > 0 else None
+            tasks = self.manager.decompose_goal(self.state.goal, feedback=feedback)
+            errors = self.validator.validate(tasks)
+
+            if not errors:
+                return tasks
+
+            self.state_store.log_event(
+                "decomposition_validation_failed",
+                {"attempt": attempt + 1, "errors": errors},
+            )
+
+        # If LLM decomposition failed all retries, fall back to deterministic decomposition
+        fallback_tasks = self.manager._decompose_deterministic(self.state.goal)
+        fallback_errors = self.validator.validate(fallback_tasks)
+        if not fallback_errors:
+            return fallback_tasks
+
+        raise DecompositionError(
+            f"Failed to produce a valid task decomposition after {self.max_decomposition_retries} attempts. "
+            f"Errors: {errors}"
+        )
 
     def run_until_completion(self) -> HarnessState:
         """Runs the loop until the Goal Definition of Done is fully satisfied or halted."""
