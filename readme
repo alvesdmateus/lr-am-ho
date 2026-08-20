@@ -1,0 +1,77 @@
+# Effective Harness for Long Running Agents
+Reference Papers:
+[Effective Harness for Long Running Agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+[Agentic Memory](https://arxiv.org/abs/2601.01885)
+
+## Project Description
+
+
+
+## specifications
+
+decomposition of agents
+
+### manager:
+owns the task state 
+
+### worker:
+idempotent, stateless
+picks up task runs until completion
+doesnt hold context
+    - tool sidecar
+    Safety Interception: Inspects commands against safety policies to block destructive commands (rm -rf /, mkfs, etc.).
+    Output Truncation: Automatically compresses large compiler / test outputs (preserving 40 head lines and 40 tail lines   with a truncation notice) to prevent context window exhaustion.
+    Operations: Provides secure, sandboxed handlers for BASH, FILE_WRITE, FILE_READ, RUN_TESTS, and GIT_DIFF.
+
+    - worker pod
+
+    MicroPlanner: Formulates 2–4 immediate sub-actions based on the task description and injected memory briefing.
+    ActionEngine: Drives step-by-step execution through the ToolSidecar.
+    WorkspaceTracker: Captures git diffs and records task-scoped atomic commit hashes.
+    Worker: Coordinates the micro-loop, halting on failures and returning a structured ExecutionResult
+
+### evaluator:
+audits worker
+if task pass the audit -> manager marks task as done
+if task fail the audit -> feedback to worker, worker retry
+
+### memory and knowledge
+├── Episodic
+│
+├── Semantic
+│
+├── Procedural
+│
+└── Epistemic
+
+## Harness
+harness owns reliability and reproducibility 
+
+- The Loop Controller (orchestrates manager -> worker -> evaluator)
+- Memory System (stores episodic / semantic / procedural / epistemic knowledge)
+- Reliable Messaging (ensure task status propagates even if components crash)
+
+## Data flow
+1. A high-level task is received by the Loop Controller.
+2. The Loop Controller creates a new TaskContext in the database.
+3. The Loop Controller updates the task status to RUNNING and triggers the Manager agent.
+4. The Manager agent retrieves the TaskContext, plans an initial sub-task, and sets it as the current_sub_task.
+5. The Loop Controller detects the new sub-task and assigns it to an available Worker.
+6. The Worker retrieves the sub-task, retrieves the TaskContext for briefing, and interacts with the ToolSidecar to execute atomic steps.
+7. After each atomic step, the Worker updates the ToolLog, updates the sub-task status (e.g., COMPLETED), and then calls UpdateSubTask.
+8. The Manager agent receives the UpdateSubTask event and, upon completion of all sub-tasks, triggers the Evaluator agent.
+9. The Evaluator agent inspects the results and either marks the task as DONE or sends feedback to the Manager for retry.
+10. Reliable Messaging ensures that if any component crashes (e.g., the Manager), the Loop Controller detects the failure and restarts the component from a consistent state.
+
+### to do's:
+
+[] implement data distillation step for worker compressing tooling output
+[] implement tool sidecar comunication
+[] implement evaluator agent
+[] implement loop controller
+[] implement harness
+[] implement memory and knowledge
+[] conciliation loops for each primitive/atomic component
+[] implement rbac access for each primitive/atomic component
+
+
